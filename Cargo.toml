@@ -1,0 +1,20 @@
+[package]
+name = "badge_r2_fw"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cortex-m-rt = "0.7"
+micromath = "2"
+panic-halt = "0.2"
+
+[dependencies.atsamd-hal]
+version = "0.15"
+default-features = false
+features = ["samd21e", "samd21e-rt", "dma"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = true
