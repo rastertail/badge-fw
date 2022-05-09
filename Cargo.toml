@@ -1,5 +1,5 @@
 [package]
-name = "badge_r2_fw"
+name = "badge-fw"
 version = "0.1.0"
 edition = "2021"
 
