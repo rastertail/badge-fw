@@ -15,7 +15,7 @@ pub const fn expand(pattern_hi: usize, pattern_lo: usize) -> [u8; 256] {
     table
 }
 
-pub static LOOKUP_A: [u8; 256] = expand(0b10000000, 0b01000000);
-pub static LOOKUP_B: [u8; 256] = expand(0b00100000, 0b00010000);
-pub static LOOKUP_C: [u8; 256] = expand(0b00001000, 0b00000100);
-pub static LOOKUP_D: [u8; 256] = expand(0b00000010, 0b00000001);
+pub const LOOKUP_A: [u8; 256] = expand(0b10000000, 0b01000000);
+pub const LOOKUP_B: [u8; 256] = expand(0b00100000, 0b00010000);
+pub const LOOKUP_C: [u8; 256] = expand(0b00001000, 0b00000100);
+pub const LOOKUP_D: [u8; 256] = expand(0b00000010, 0b00000001);
