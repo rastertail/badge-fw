@@ -1,0 +1,11 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Program MCU",
+            "type": "shell",
+            "command": "${workspaceFolder}/program.sh",
+            "problemMatcher": []
+        }
+    ]
+}
