@@ -23,7 +23,6 @@ mod bit_expand;
 const N_LEDS: usize = 20;
 static mut DMA_BUFFER: [u8; N_LEDS * 4 * 3 + 120] = [0u8; N_LEDS * 4 * 3 + 120];
 
-const ANIM_LEN: u32 = 10;
 const BRIGHTNESS: f32 = 48.0;
 
 const LED_COORDS: [(f32, f32); 20] = [
@@ -70,30 +69,18 @@ fn write_pixel(n: usize, r: u8, g: u8, b: u8) {
     }
 }
 
-fn mix(a: f32, b: f32, c: f32) -> f32 {
-    a * (1.0 - c) + b * c
-}
-
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
-    let r = v * mix(1.0, ((h + 1.0).fract() * 6.0 - 2.0).min(1.0).max(0.0), s);
-    let g = v * mix(
-        1.0,
-        ((h + 2.0 / 3.0).fract() * 6.0 - 2.0).min(1.0).max(0.0),
-        s,
-    );
-    let b = v * mix(
-        1.0,
-        ((h + 1.0 / 3.0).fract() * 6.0 - 2.0).min(1.0).max(0.0),
-        s,
-    );
-
-    (r, g, b)
+    (
+        ((((h * 6.0 - 3.0).abs() - 1.0).min(1.0).max(0.0) - 1.0) * s + 1.0) * v,
+        (((2.0 - (h * 6.0 - 2.0).abs()).min(1.0).max(0.0) - 1.0) * s + 1.0) * v,
+        (((2.0 - (h * 6.0 - 4.0).abs()).min(1.0).max(0.0) - 1.0) * s + 1.0) * v,
+    )
 }
 
 fn anim(t: f32, x: f32, y: f32) -> (f32, f32, f32) {
-    let x = x + 1.0;
-    let y = y + 1.0;
-    let hue = ((x * x + y * y).sqrt() * 0.25 - t).fract().abs();
+    let x = x - 1.4;
+    let y = y - 2.4;
+    let hue = ((x * x + y * y).sqrt() * 0.25 - 0.5 * t).fract().abs();
     hsv_to_rgb(hue, 1.0, 1.0)
 }
 
