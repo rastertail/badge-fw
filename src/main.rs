@@ -143,14 +143,15 @@ fn main() -> ! {
         .begin(TriggerSource::SERCOM0_TX, TriggerAction::BEAT);
 
     // Render loop
+    let mut t = 0f32;
     loop {
-        let mut t = rtc.count32();
-        if t > 32_768 * ANIM_LEN {
+        let sub = rtc.count32();
+        if sub > 32_768 {
             rtc.set_count32(0);
-            t = 0;
+            t += 1.0;
         }
 
-        let t = (t as f32) / 32_768f32;
+        let t = t + (sub % 32_768) as f32 / 32_768.0;
 
         for i in 0..N_LEDS {
             let (x, y) = LED_COORDS[i];
