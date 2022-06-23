@@ -13,4 +13,12 @@ fn main() {
         println!("cargo:rerun-if-changed=memory.x");
     }
     println!("cargo:rerun-if-changed=build.rs");
+
+    println!("cargo:rustc-link-search=./cmsis");
+    println!("cargo:rustc-link-lib=static=CMSISDSPBasicMath");
+    println!("cargo:rustc-link-lib=static=CMSISDSPCommon");
+    println!("cargo:rustc-link-lib=static=CMSISDSPComplexMath");
+    println!("cargo:rustc-link-lib=static=CMSISDSPFastMath");
+    println!("cargo:rustc-link-lib=static=CMSISDSPSupport");
+    println!("cargo:rustc-link-lib=static=CMSISDSPTransform");
 }
