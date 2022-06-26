@@ -5,23 +5,32 @@ extern crate panic_halt;
 
 use core::{
     mem::MaybeUninit,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 
 use atsamd_hal::{
     clock::{ClockGenId, ClockSource, GenericClockController},
     dmac::{DmaController, PriorityLevel, Transfer, TriggerAction, TriggerSource},
-    gpio::{pin, Pins},
-    pac::{interrupt, Interrupt, Peripherals, ADC, NVIC},
+    ehal::blocking::i2c::{Write, WriteRead},
+    eic::{
+        self,
+        pin::{EicPin, Sense},
+    },
+    gpio::{self, pin, AlternateD, Pin, Pins},
+    pac::{self, interrupt, Interrupt, Peripherals, ADC, NVIC},
     rtc::Rtc,
     sercom::{
+        i2c,
         spi::{self, BitOrder, EightBit},
-        Sercom0,
+        Sercom0, Sercom2,
     },
     time::U32Ext,
 };
 use cortex_m_rt::entry;
 use micromath::F32Ext;
+
+type I2cPads = i2c::Pads<Sercom2, Pin<gpio::PA08, AlternateD>, Pin<gpio::PA09, AlternateD>>;
+type I2c = i2c::I2c<i2c::Config<I2cPads>>;
 
 #[repr(C)]
 struct arm_cfft_instance_q15 {
@@ -46,11 +55,6 @@ static mut ADC_BUFFER: [u16; FFT_SAMPLES] = [0u16; FFT_SAMPLES];
 static ADC_END: AtomicUsize = AtomicUsize::new(0);
 static mut FFT_BUFFER: [i16; FFT_SAMPLES * 2] = [0i16; FFT_SAMPLES * 2];
 static mut FFT_F32: [f32; FFT_SAMPLES] = [0f32; FFT_SAMPLES];
-
-const N_LEDS: usize = 20;
-static mut DMA_BUFFER: [u8; N_LEDS * 4 * 3 + 120] = [0u8; N_LEDS * 4 * 3 + 120];
-
-const BRIGHTNESS: f32 = 48.0;
 
 const HAMMING_LUT: [f32; FFT_SAMPLES] = [
     0.0801385, 0.0805541, 0.0812464, 0.082215, 0.0834594, 0.0849788, 0.0867723, 0.0888388,
@@ -84,6 +88,11 @@ const HAMMING_LUT: [f32; FFT_SAMPLES] = [
     0.0805541, 0.0801385, 0.08,
 ];
 
+const N_LEDS: usize = 20;
+static mut DMA_BUFFER: [u8; N_LEDS * 4 * 3 + 120] = [0u8; N_LEDS * 4 * 3 + 120];
+
+const BRIGHTNESS: f32 = 48.0;
+
 const LED_COORDS: [(f32, f32); 20] = [
     (2.25, 0.0),
     (3.0, 2.2),
@@ -113,6 +122,13 @@ const GRADIENT: [[f32; 3]; 4] = [
     [0.89, 0.33, 0.29],
     [1.0, 0.69, 0.02],
 ];
+
+static EYE_MODE: AtomicU8 = AtomicU8::new(0);
+static NAME_MODE: AtomicU8 = AtomicU8::new(0);
+static NAME_SUBMODE: AtomicU8 = AtomicU8::new(0);
+
+static mut CAP1206_I2C: Option<I2c> = None;
+const CAP1206_ADDR: u8 = 0b0101000;
 
 fn write_pixel(n: usize, r: u8, g: u8, b: u8) {
     let base = n * 4 * 3;
@@ -164,6 +180,59 @@ fn ADC() {
     }
 }
 
+#[interrupt]
+fn EIC() {
+    // Ack interrupt
+    unsafe {
+        CAP1206_I2C
+            .as_mut()
+            .unwrap()
+            .write(CAP1206_ADDR, &[0x00, 0x00])
+            .unwrap();
+    }
+
+    // Safety: Only this interrupt ever performs I2C transactions
+    let status = unsafe {
+        let mut buf = [0u8; 1];
+        CAP1206_I2C
+            .as_mut()
+            .unwrap()
+            .write_read(CAP1206_ADDR, &[0x03], &mut buf)
+            .unwrap();
+        buf[0]
+    };
+
+    let cur_name_mode = NAME_MODE.load(Ordering::SeqCst);
+    if status & 0b00100000 > 0 {
+        let mode = EYE_MODE.load(Ordering::SeqCst);
+        EYE_MODE.store((mode + 1) % 3, Ordering::SeqCst);
+    } else if status & 0b00010000 > 0 {
+        NAME_MODE.store(0, Ordering::SeqCst);
+        NAME_SUBMODE.store(0, Ordering::SeqCst);
+    } else if status & 0b00001000 > 0 {
+        if cur_name_mode == 1 {
+            NAME_MODE.store(1, Ordering::SeqCst);
+            let sub = NAME_SUBMODE.load(Ordering::SeqCst);
+            NAME_SUBMODE.store((sub + 1) % 5, Ordering::SeqCst);
+        } else {
+            NAME_MODE.store(1, Ordering::SeqCst);
+            NAME_SUBMODE.store(0, Ordering::SeqCst);
+        }
+    } else if status & 0b00000100 > 0 {
+        NAME_MODE.store(2, Ordering::SeqCst);
+        NAME_SUBMODE.store(0, Ordering::SeqCst);
+    }
+
+    // Assume we are only using EXTINT3
+    unsafe {
+        pac::EIC::ptr()
+            .as_ref()
+            .unwrap()
+            .intflag
+            .modify(|_, w| w.extint3().set_bit());
+    }
+}
+
 #[entry]
 fn main() -> ! {
     let mut peripherals = Peripherals::take().unwrap();
@@ -179,20 +248,52 @@ fn main() -> ! {
     // Initialize GPIO
     let pins = Pins::new(peripherals.PORT);
 
-    // Initialize SPI clock
+    // Initialize serial clocks
     let gclk0 = clocks.gclk0();
     let spi_clock = clocks.sercom0_core(&gclk0).unwrap();
+    let i2c_clock = clocks.sercom2_core(&gclk0).unwrap();
 
     // Initialize SPI
-    let pads = spi::Pads::<Sercom0>::default()
+    let spi_pads = spi::Pads::<Sercom0>::default()
         .data_out(pins.pa04)
         .sclk(pins.pa05);
-    let spi = spi::Config::new(&peripherals.PM, peripherals.SERCOM0, pads, spi_clock.freq())
-        .spi_mode(spi::MODE_0)
-        .bit_order(BitOrder::MsbFirst)
-        .baud(3200.khz())
-        .char_size::<EightBit>()
-        .enable();
+    let spi = spi::Config::new(
+        &peripherals.PM,
+        peripherals.SERCOM0,
+        spi_pads,
+        spi_clock.freq(),
+    )
+    .spi_mode(spi::MODE_0)
+    .bit_order(BitOrder::MsbFirst)
+    .baud(3200.khz())
+    .char_size::<EightBit>()
+    .enable();
+
+    // Initialize IRQ pin
+    let eic_clock = clocks.eic(&gclk0).unwrap();
+    let mut eic = eic::EIC::init(&mut peripherals.PM, eic_clock, peripherals.EIC);
+    let mut cap1206_irq = pins.pa03.into_floating_ei();
+    cap1206_irq.sense(&mut eic, Sense::FALL);
+    cap1206_irq.enable_interrupt(&mut eic);
+    unsafe {
+        NVIC::unmask(Interrupt::EIC);
+    }
+
+    // Initialize I2C
+    let i2c_pads = i2c::Pads::<Sercom2, _, _>::new(pins.pa08, pins.pa09);
+    let mut i2c = i2c::Config::new(
+        &peripherals.PM,
+        peripherals.SERCOM2,
+        i2c_pads,
+        i2c_clock.freq(),
+    )
+    .baud(50.khz())
+    .enable();
+    while i2c.write(CAP1206_ADDR, &[0x00, 0x00]).is_err() {} // Clear interrupts and wait for power up
+    i2c.write(CAP1206_ADDR, &[0x28, 0x00]).unwrap(); // Disable repeats
+    unsafe {
+        CAP1206_I2C = Some(i2c);
+    }
 
     // Mnually initialize ADC
     let gclk2 = clocks
@@ -274,6 +375,9 @@ fn main() -> ! {
     let mut t = 0f32;
     let mut led_amp = [0f32; N_LEDS];
     loop {
+        let name_mode = NAME_MODE.load(Ordering::SeqCst);
+        let name_submode = NAME_SUBMODE.load(Ordering::SeqCst);
+
         let sub = rtc.count32();
         if sub > 32_768 {
             rtc.set_count32(0);
@@ -281,79 +385,125 @@ fn main() -> ! {
         }
         let t = t + (sub % 32_768) as f32 / 32_768.0;
 
-        // Copy into buffer
-        unsafe {
-            let start = ADC_END.load(Ordering::SeqCst) + 1;
-            for i in 0..FFT_SAMPLES {
-                let j = (start + i) % FFT_SAMPLES;
-                let v = ADC_BUFFER[j];
-                FFT_BUFFER[i * 2] = ((v as f32 - 2048.0) * HAMMING_LUT[i] * 20.0) as i16;
-                FFT_BUFFER[i * 2 + 1] = 0;
-            }
-        }
-
-        // Evaluate FFT, get magnitudes, and convert to floats
-        unsafe {
-            arm_cfft_q15(&fft, FFT_BUFFER.as_mut_ptr(), 0, 1);
-            arm_cmplx_mag_q15(
-                FFT_BUFFER.as_ptr(),
-                FFT_BUFFER.as_mut_ptr(),
-                FFT_SAMPLES as u32,
-            );
-            arm_q15_to_float(
-                FFT_BUFFER.as_ptr(),
-                FFT_F32.as_mut_ptr(),
-                FFT_SAMPLES as u32,
-            );
-            arm_scale_f32(
-                FFT_F32.as_ptr(),
-                2048.0,
-                FFT_F32.as_mut_ptr(),
-                FFT_SAMPLES as u32,
-            );
-        }
-
-        for i in 0..N_LEDS {
-            let (x, y) = LED_COORDS[i];
-            // let v = anim(t, x, y);
-
-            let fft_bin = ((1.5 - (1.5 - x).abs()) / 2.0 * FFT_SAMPLES as f32) as i32;
-            let fft_min = (fft_bin - 16).max(1) as usize;
-            let fft_max = (fft_bin + 16).min(FFT_SAMPLES as i32 - 2) as usize;
-
-            let mut avg_amp = 0f32;
+        if name_mode == 1 {
+            // Copy into buffer
             unsafe {
-                for i in fft_min..fft_max {
-                    avg_amp += FFT_F32[i].sqrt();
+                let gain = match name_submode {
+                    0 => 20.0,
+                    1 => 10.0,
+                    2 => 5.0,
+                    3 => 2.0,
+                    4 => 1.0,
+                    _ => 0.0,
+                };
+
+                let start = ADC_END.load(Ordering::SeqCst) + 1;
+                for i in 0..FFT_SAMPLES {
+                    let j = (start + i) % FFT_SAMPLES;
+                    let v = ADC_BUFFER[j];
+                    FFT_BUFFER[i * 2] = ((v as f32 - 2048.0) * HAMMING_LUT[i] * gain) as i16;
+                    FFT_BUFFER[i * 2 + 1] = 0;
                 }
             }
-            avg_amp /= (fft_max - fft_min) as f32;
-            if avg_amp < 0.6 {
-                avg_amp = 0.0;
-            } else {
-                avg_amp = (avg_amp - 0.6) * 3.0;
+
+            // Evaluate FFT, get magnitudes, and convert to floats
+            unsafe {
+                arm_cfft_q15(&fft, FFT_BUFFER.as_mut_ptr(), 0, 1);
+                arm_cmplx_mag_q15(
+                    FFT_BUFFER.as_ptr(),
+                    FFT_BUFFER.as_mut_ptr(),
+                    FFT_SAMPLES as u32,
+                );
+                arm_q15_to_float(
+                    FFT_BUFFER.as_ptr(),
+                    FFT_F32.as_mut_ptr(),
+                    FFT_SAMPLES as u32,
+                );
+                arm_scale_f32(
+                    FFT_F32.as_ptr(),
+                    2048.0,
+                    FFT_F32.as_mut_ptr(),
+                    FFT_SAMPLES as u32,
+                );
             }
+        }
 
-            let a = led_amp[i];
-            let smoothed = if avg_amp > a {
-                avg_amp
-            } else {
-                0.75 * a + 0.25 * avg_amp
-            };
-            led_amp[i] = smoothed;
+        match EYE_MODE.load(Ordering::SeqCst) {
+            0 => {
+                write_pixel(0, 30, 15, 5);
+            }
+            1 => {
+                let rgb = hsv_to_rgb((t * 0.1).fract(), 1.0, 1.0);
+                write_pixel(
+                    0,
+                    (rgb.0 * BRIGHTNESS) as u8,
+                    (rgb.1 * BRIGHTNESS) as u8,
+                    (rgb.2 * BRIGHTNESS) as u8,
+                );
+            }
+            2 => {
+                write_pixel(0, 48, 0, 0);
+            }
+            _ => (),
+        }
 
-            let clamped = smoothed.min(1.0).max(0.0) * 3.0;
-            let stop = clamped as usize;
-            let next_stop = (stop + 1).min(GRADIENT.len() - 1);
-            let k = clamped.fract();
-            let [r1, g1, b1] = GRADIENT[stop];
-            let [r2, g2, b2] = GRADIENT[next_stop];
-            write_pixel(
-                i,
-                (((1.0 - k) * r1 + k * r2) * BRIGHTNESS) as u8,
-                (((1.0 - k) * g1 + k * g2) * BRIGHTNESS) as u8,
-                (((1.0 - k) * b1 + k * b2) * BRIGHTNESS) as u8,
-            );
+        for i in 1..N_LEDS {
+            let (x, y) = LED_COORDS[i];
+
+            match name_mode {
+                0 => {
+                    let v = anim(t, x, y);
+                    write_pixel(
+                        i,
+                        (v.0 * BRIGHTNESS) as u8,
+                        (v.1 * BRIGHTNESS) as u8,
+                        (v.2 * BRIGHTNESS) as u8,
+                    );
+                }
+                1 => {
+                    let fft_bin = ((1.5 - (1.5 - x).abs()) / 2.0 * FFT_SAMPLES as f32) as i32;
+                    let fft_min = (fft_bin - 16).max(1) as usize;
+                    let fft_max = (fft_bin + 16).min(FFT_SAMPLES as i32 - 2) as usize;
+
+                    let mut avg_amp = 0f32;
+                    unsafe {
+                        for i in fft_min..fft_max {
+                            avg_amp += FFT_F32[i].sqrt();
+                        }
+                    }
+                    avg_amp /= (fft_max - fft_min) as f32;
+                    if avg_amp < 0.6 {
+                        avg_amp = 0.0;
+                    } else {
+                        avg_amp = (avg_amp - 0.6) * 3.0;
+                    }
+
+                    let a = led_amp[i];
+                    let smoothed = if avg_amp > a {
+                        avg_amp
+                    } else {
+                        0.75 * a + 0.25 * avg_amp
+                    };
+                    led_amp[i] = smoothed;
+
+                    let clamped = smoothed.min(1.0).max(0.0) * 3.0;
+                    let stop = clamped as usize;
+                    let next_stop = (stop + 1).min(GRADIENT.len() - 1);
+                    let k = clamped.fract();
+                    let [r1, g1, b1] = GRADIENT[stop];
+                    let [r2, g2, b2] = GRADIENT[next_stop];
+                    write_pixel(
+                        i,
+                        (((1.0 - k) * r1 + k * r2) * BRIGHTNESS) as u8,
+                        (((1.0 - k) * g1 + k * g2) * BRIGHTNESS) as u8,
+                        (((1.0 - k) * b1 + k * b2) * BRIGHTNESS) as u8,
+                    );
+                }
+                2 => {
+                    write_pixel(i, 48, 0, 0);
+                }
+                _ => (),
+            }
         }
     }
 }
